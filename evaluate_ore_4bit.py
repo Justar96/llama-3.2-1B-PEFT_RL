@@ -77,19 +77,16 @@ def main():
     parser.add_argument("--base_model_name_or_path", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Base model identifier or path")
     args = parser.parse_args()
 
-    # Load dataset and split
+    # Load dataset and create a held-out evaluation split
+    print(f"Loading dataset from {args.data_path} and creating a {args.split_ratio*100:.0f}% held-out split...")
     ds = load_dataset("json", data_files=args.data_path)["train"]
     split = ds.train_test_split(test_size=args.split_ratio, seed=42)
     eval_ds = split["test"]
+    print(f"Evaluation dataset size: {len(eval_ds)} examples.")
 
-    # Prepare device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Silence generation warnings
     warnings.filterwarnings("ignore", message="`do_sample` is set to `False`.*")
-    # Silence bitsandbytes Linear4bit compute dtype mismatch warning
     warnings.filterwarnings("ignore", message="Input type into Linear4bit is torch.float16, but bnb_4bit_compute_dtype=.*")
-    # Silence pad_token_id auto-setting warnings
     warnings.filterwarnings("ignore", message="Setting `pad_token_id` to `eos_token_id`.*")
 
     # Load merged LoRA model in 4-bit
@@ -98,16 +95,27 @@ def main():
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16  # match input type for faster inference
+        bnb_4bit_compute_dtype=torch.float16
     )
     lora_model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
         quantization_config=quant_config,
         device_map="auto"
     )
-    lora_model.config.pad_token_id = lora_model.config.eos_token_id
-    lora_model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+
+    # Configure pad token for LoRA model and tokenizer
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token # This also sets tokenizer.pad_token_id
+    
+    lora_eos_token_id_int = tokenizer.eos_token_id
+    if isinstance(lora_eos_token_id_int, list):
+        lora_eos_token_id_int = lora_eos_token_id_int[0] # Ensure integer
+
+    lora_model.config.pad_token_id = tokenizer.pad_token_id # Set main model config
+    if hasattr(lora_model, "generation_config") and lora_eos_token_id_int is not None:
+        lora_model.generation_config.pad_token_id = lora_eos_token_id_int # Explicitly set for generation
+    lora_model.eval()
     evaluate_model(lora_model, tokenizer, eval_ds, device, args.max_new_tokens, "LoRA-merged 4bit")
 
     # Optionally evaluate base model
@@ -118,9 +126,20 @@ def main():
             device_map="auto",
             torch_dtype=torch.bfloat16
         )
-        base_model.config.pad_token_id = base_model.config.eos_token_id
-        base_model.to(device).eval()
         tokenizer_base = AutoTokenizer.from_pretrained(args.base_model_name_or_path)
+
+        # Configure pad token for baseline model and tokenizer
+        if tokenizer_base.pad_token is None:
+            tokenizer_base.pad_token = tokenizer_base.eos_token # This also sets tokenizer_base.pad_token_id
+
+        base_eos_token_id_int = tokenizer_base.eos_token_id
+        if isinstance(base_eos_token_id_int, list):
+            base_eos_token_id_int = base_eos_token_id_int[0] # Ensure integer
+
+        base_model.config.pad_token_id = tokenizer_base.pad_token_id # Set main model config
+        if hasattr(base_model, "generation_config") and base_eos_token_id_int is not None:
+            base_model.generation_config.pad_token_id = base_eos_token_id_int # Explicitly set for generation
+        base_model.to(device).eval()
         evaluate_model(base_model, tokenizer_base, eval_ds, device, args.max_new_tokens, "Base model")
 
 if __name__ == "__main__":
